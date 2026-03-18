@@ -115,7 +115,7 @@ function sortKey(wy, wz) {
 // ── Ball ───────────────────────────────────────────────────
 let ball = { x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0, r: 4, owner: null };
 const GRAVITY = 400;
-const BALL_FRICTION = 0.987;
+const BALL_FRICTION = 0.996;
 const BALL_BOUNCE = 0.5;
 
 function resetBall() {
@@ -332,11 +332,12 @@ function smartKick(player, dirX, dirY, teammates, teamSide) {
     const ty = bestMate.y + bestMate.vy * 0.3;
     const px = tx - player.x, py = ty - player.y;
     const dist = Math.sqrt(px * px + py * py);
-    const power = Math.min(PASS_POWER, Math.max(180, dist * 0.7));
-    kickBall(player, px, py, power, 20 + dist * 0.05);
+    // Strong ground pass — scale power with distance, low loft
+    const power = Math.max(PASS_POWER, dist * 1.1);
+    kickBall(player, px, py, power, 8);
   } else {
     // No good teammate found — just kick in facing direction
-    kickBall(player, ndx, ndy, KICK_POWER * 0.7, 40);
+    kickBall(player, ndx, ndy, KICK_POWER * 0.85, 10);
   }
 }
 
@@ -691,9 +692,9 @@ function updatePhysics(dt) {
       ball.z = 0;
       ball.vz = -ball.vz * BALL_BOUNCE;
       if (Math.abs(ball.vz) < 10) ball.vz = 0;
-      // More friction on ground
-      ball.vx *= 0.95;
-      ball.vy *= 0.95;
+      // Slight friction on ground bounce
+      ball.vx *= 0.98;
+      ball.vy *= 0.98;
     }
 
     ball.vx *= BALL_FRICTION;
@@ -1175,6 +1176,7 @@ function drawMenuMode(time) {
   drawRetroText('FOOTBALL', W / 2, titleY + 50, 28, '#fff');
   ctx.shadowBlur = 0;
   drawRetroText('RETRO EDITION', W / 2, titleY + 90, 10, '#0f0');
+  drawRetroText('by Joe', W / 2, titleY + 115, 9, '#aaa');
 
   // Decorative ball
   const bx = W / 2, by = titleY + 140;
