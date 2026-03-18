@@ -1,0 +1,1381 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Star Football</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap');
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #111;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    height: 100vh;
+    overflow: hidden;
+    font-family: 'Press Start 2P', monospace;
+  }
+  canvas {
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+    border: 4px solid #333;
+    cursor: default;
+    max-width: 100vw;
+    max-height: 100vh;
+  }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+// ============================================================
+//  STAR FOOTBALL — Retro Soccer Game (Isometric Edition)
+// ============================================================
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+
+const W = 1200, H = 750;
+canvas.width = W;
+canvas.height = H;
+
+// ── Teams ──────────────────────────────────────────────────
+const TEAMS = [
+  { name: 'BARCELONA',       primary: '#A50044', secondary: '#004D98', gk: '#FFD700', short: 'BAR' },
+  { name: 'REAL MADRID',     primary: '#FFFFFF', secondary: '#FEBE10', gk: '#1C1C1C', short: 'RMA' },
+  { name: 'MAN CITY',        primary: '#6CABDD', secondary: '#1C2C5B', gk: '#E8FF00', short: 'MCI' },
+  { name: 'MAN UNITED',      primary: '#DA291C', secondary: '#FBE122', gk: '#55DD55', short: 'MUN' },
+  { name: 'LIVERPOOL',       primary: '#C8102E', secondary: '#00B2A9', gk: '#AAAAAA', short: 'LIV' },
+  { name: 'BAYERN MUNICH',   primary: '#DC052D', secondary: '#0066B2', gk: '#88FF88', short: 'BAY' },
+  { name: 'SHEFFIELD UTD',   primary: '#EE2737', secondary: '#000000', gk: '#44AAFF', short: 'SHU' },
+  { name: 'ATLETICO MADRID', primary: '#CB3524', secondary: '#FFFFFF', gk: '#00CC77', short: 'ATM' },
+  { name: 'LA GALAXY',       primary: '#00245D', secondary: '#FFD200', gk: '#FF8800', short: 'LAG' },
+  { name: 'INTER MIAMI',     primary: '#F7B5CD', secondary: '#231F20', gk: '#55CCFF', short: 'MIA' },
+];
+
+// ── Game State ─────────────────────────────────────────────
+let state = 'menu_mode';
+let gameMode = null;
+let team1Idx = 0, team2Idx = 1;
+let menuCursor = 0;
+let score = [0, 0];
+let half = 1;
+let matchTimer = 0;
+const HALF_DURATION = 300;
+let goalTimer = 0;
+let goalScorer = 0;
+let lastTime = 0;
+let kickoffPending = false;
+let kickoffTimer = 0;
+
+// ── Input ──────────────────────────────────────────────────
+const keys = {};
+const justPressed = {};
+document.addEventListener('keydown', e => {
+  if (!keys[e.code]) justPressed[e.code] = true;
+  keys[e.code] = true;
+  handleMenuInput(e.code);
+  e.preventDefault();
+});
+document.addEventListener('keyup', e => {
+  keys[e.code] = false;
+  e.preventDefault();
+});
+
+// ── Game World Coordinates ─────────────────────────────────
+// World: x = across pitch (0 = left goal line, GW = right goal line)
+//        y = depth into pitch (0 = near sideline, GH = far sideline)
+//        z = height above ground
+const GW = 840; // pitch width in world units
+const GH = 520; // pitch depth in world units
+const GOAL_HEIGHT = 55; // goal height in world z-units
+const GOAL_DEPTH = 110; // goal width on y-axis (centered)
+const GOAL_NET_DEPTH = 35; // how far back the net goes
+
+// ── Isometric Projection ───────────────────────────────────
+// We view the pitch at ~45 degrees from one side, elevated
+const ISO_SCALE_X = 1.15;
+const ISO_SCALE_Y = 0.58; // vertical compression for depth
+const ISO_OFFSET_X = 120;
+const ISO_OFFSET_Y = 110;
+
+function project(wx, wy, wz) {
+  // wx = across, wy = depth (0=near, GH=far), wz = height
+  const sx = ISO_OFFSET_X + wx * ISO_SCALE_X;
+  const sy = ISO_OFFSET_Y + wy * ISO_SCALE_Y - wz * 0.8;
+  return { x: sx, y: sy };
+}
+
+// Sort key for draw order: further from camera (higher wy) drawn first
+function sortKey(wy, wz) {
+  return wy - wz * 0.01;
+}
+
+// ── Ball ───────────────────────────────────────────────────
+let ball = { x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0, r: 4, owner: null };
+const GRAVITY = 400;
+const BALL_FRICTION = 0.987;
+const BALL_BOUNCE = 0.5;
+
+function resetBall() {
+  ball.x = GW / 2;
+  ball.y = GH / 2;
+  ball.z = 0;
+  ball.vx = 0;
+  ball.vy = 0;
+  ball.vz = 0;
+  ball.owner = null;
+}
+
+// ── Players ────────────────────────────────────────────────
+const PLAYER_SPEED = 170;
+const KICK_POWER = 380;
+const PASS_POWER = 280;
+const AI_SPEED = 175;
+const TACKLE_DIST = 22;
+const POSSESS_DIST = 20;
+
+function createTeamPlayers(teamSide) {
+  const cx = teamSide === 1 ? 0 : GW;
+  const dir = teamSide === 1 ? 1 : -1;
+  const cy = GH / 2;
+  const positions = [
+    { x: cx + dir * 30,  y: cy, role: 'GK' },
+    { x: cx + dir * 170, y: cy - 120, role: 'DEF' },
+    { x: cx + dir * 170, y: cy + 120, role: 'DEF2' },
+    { x: cx + dir * 330, y: cy - 70, role: 'MID' },
+    { x: cx + dir * 480, y: cy + 40, role: 'FWD' },
+  ];
+  return positions.map(p => ({
+    x: p.x, y: p.y, z: 0,
+    homeX: p.x, homeY: p.y,
+    vx: 0, vy: 0, r: 8, role: p.role, team: teamSide,
+    kickCooldown: 0, walkCycle: Math.random() * Math.PI * 2,
+    facingX: dir, facingY: 0,
+  }));
+}
+
+let players1 = [], players2 = [];
+let controlled1 = 0, controlled2 = 0;
+
+function resetPlayers() {
+  players1 = createTeamPlayers(1);
+  players2 = createTeamPlayers(2);
+  controlled1 = 4;
+  controlled2 = 4;
+}
+
+function resetForKickoff() {
+  resetPlayers();
+  resetBall();
+  kickoffPending = true;
+  kickoffTimer = 1.5;
+}
+
+// ── Menu Input ─────────────────────────────────────────────
+function handleMenuInput(code) {
+  if (state === 'menu_mode') {
+    if (code === 'ArrowUp' || code === 'KeyW') menuCursor = (menuCursor + 1) % 2;
+    if (code === 'ArrowDown' || code === 'KeyS') menuCursor = (menuCursor + 1) % 2;
+    if (code === 'Enter' || code === 'Space') {
+      gameMode = menuCursor === 0 ? '1p' : '2p';
+      state = 'menu_team1';
+      menuCursor = 0;
+    }
+  } else if (state === 'menu_team1') {
+    if (code === 'ArrowUp' || code === 'KeyW') menuCursor = (menuCursor - 1 + TEAMS.length) % TEAMS.length;
+    if (code === 'ArrowDown' || code === 'KeyS') menuCursor = (menuCursor + 1) % TEAMS.length;
+    if (code === 'Enter' || code === 'Space') {
+      team1Idx = menuCursor;
+      state = 'menu_team2';
+      menuCursor = team1Idx === 0 ? 1 : 0;
+    }
+    if (code === 'Escape') { state = 'menu_mode'; menuCursor = 0; }
+  } else if (state === 'menu_team2') {
+    if (code === 'ArrowUp' || code === 'KeyW') {
+      menuCursor = (menuCursor - 1 + TEAMS.length) % TEAMS.length;
+      if (menuCursor === team1Idx) menuCursor = (menuCursor - 1 + TEAMS.length) % TEAMS.length;
+    }
+    if (code === 'ArrowDown' || code === 'KeyS') {
+      menuCursor = (menuCursor + 1) % TEAMS.length;
+      if (menuCursor === team1Idx) menuCursor = (menuCursor + 1) % TEAMS.length;
+    }
+    if (code === 'Enter' || code === 'Space') {
+      team2Idx = menuCursor;
+      startMatch();
+    }
+    if (code === 'Escape') { state = 'menu_team1'; menuCursor = team1Idx; }
+  } else if (state === 'halftime') {
+    if (code === 'Enter' || code === 'Space') {
+      half = 2;
+      matchTimer = 0;
+      resetForKickoff();
+      state = 'playing';
+    }
+  } else if (state === 'fulltime') {
+    if (code === 'Enter' || code === 'Space') {
+      state = 'menu_mode';
+      menuCursor = 0;
+    }
+  }
+}
+
+function startMatch() {
+  score = [0, 0];
+  half = 1;
+  matchTimer = 0;
+  resetForKickoff();
+  state = 'playing';
+}
+
+// ── Find closest player ────────────────────────────────────
+function findClosestPlayer(team, bx, by) {
+  let best = 0, bestDist = Infinity;
+  const arr = team === 1 ? players1 : players2;
+  for (let i = 0; i < arr.length; i++) {
+    if (arr[i].role === 'GK') continue;
+    const dx = arr[i].x - bx, dy = arr[i].y - by;
+    const d = Math.sqrt(dx * dx + dy * dy);
+    if (d < bestDist) { bestDist = d; best = i; }
+  }
+  return best;
+}
+
+// ── Possession Logic ───────────────────────────────────────
+function tryPickupBall(player) {
+  if (ball.owner) return;
+  if (ball.z > 25) return; // ball too high to pick up
+  const dx = ball.x - player.x, dy = ball.y - player.y;
+  const dist = Math.sqrt(dx * dx + dy * dy);
+  if (dist < POSSESS_DIST) {
+    ball.owner = player;
+    ball.vx = 0; ball.vy = 0; ball.vz = 0;
+    ball.z = 0;
+  }
+}
+
+function tryTackle(tackler, ballOwner) {
+  if (!ball.owner) return;
+  if (ball.owner.team === tackler.team) return;
+  if (tackler.kickCooldown > 0) return;
+  const dx = tackler.x - ballOwner.x, dy = tackler.y - ballOwner.y;
+  const dist = Math.sqrt(dx * dx + dy * dy);
+  if (dist < TACKLE_DIST) {
+    // Steal the ball!
+    ball.owner = tackler;
+    ball.vx = 0; ball.vy = 0; ball.vz = 0;
+    tackler.kickCooldown = 0.3;
+    ballOwner.kickCooldown = 0.5;
+  }
+}
+
+function kickBall(player, dirX, dirY, power, loft) {
+  if (ball.owner !== player) return;
+  ball.owner = null;
+  const len = Math.sqrt(dirX * dirX + dirY * dirY);
+  if (len > 0) {
+    ball.vx = (dirX / len) * power;
+    ball.vy = (dirY / len) * power;
+  }
+  ball.vz = loft || 0;
+  player.kickCooldown = 0.35;
+  if (kickoffPending) kickoffPending = false;
+}
+
+// ── Player Control ─────────────────────────────────────────
+function updatePlayerControl(dt) {
+  const p1 = players1[controlled1];
+  let p1mx = 0, p1my = 0;
+
+  if (gameMode === '1p') {
+    // 1-Player: Arrow keys + Space to kick, E to lob, Q to switch
+    if (keys['ArrowUp']) p1my -= 1;
+    if (keys['ArrowDown']) p1my += 1;
+    if (keys['ArrowLeft']) p1mx -= 1;
+    if (keys['ArrowRight']) p1mx += 1;
+  } else {
+    // 2-Player: P1 uses WASD
+    if (keys['KeyW']) p1my -= 1;
+    if (keys['KeyS']) p1my += 1;
+    if (keys['KeyA']) p1mx -= 1;
+    if (keys['KeyD']) p1mx += 1;
+  }
+
+  if (p1mx || p1my) {
+    const len = Math.sqrt(p1mx * p1mx + p1my * p1my);
+    p1.vx += (p1mx / len) * PLAYER_SPEED * dt * 8;
+    p1.vy += (p1my / len) * PLAYER_SPEED * dt * 8;
+    p1.facingX = p1mx / len;
+    p1.facingY = p1my / len;
+  }
+
+  // Kick / shoot
+  if (keys['Space'] && p1.kickCooldown <= 0) {
+    if (ball.owner === p1) {
+      kickBall(p1, p1.facingX, p1.facingY, KICK_POWER, 60);
+    } else {
+      tryPickupBall(p1);
+    }
+  }
+
+  // Lofted pass
+  const lobKey1 = gameMode === '1p' ? 'ShiftLeft' : 'KeyE';
+  if (justPressed[lobKey1] && p1.kickCooldown <= 0 && ball.owner === p1) {
+    kickBall(p1, p1.facingX, p1.facingY, PASS_POWER, 130);
+  }
+
+  // Player switch
+  const switchKey1 = gameMode === '1p' ? 'KeyZ' : 'KeyQ';
+  if (justPressed[switchKey1]) {
+    controlled1 = findClosestPlayer(1, ball.x, ball.y);
+  }
+
+  // Player 2 (2-player mode only)
+  if (gameMode === '2p') {
+    const p2 = players2[controlled2];
+    let p2mx = 0, p2my = 0;
+    if (keys['ArrowUp']) p2my -= 1;
+    if (keys['ArrowDown']) p2my += 1;
+    if (keys['ArrowLeft']) p2mx -= 1;
+    if (keys['ArrowRight']) p2mx += 1;
+    if (p2mx || p2my) {
+      const len = Math.sqrt(p2mx * p2mx + p2my * p2my);
+      p2.vx += (p2mx / len) * PLAYER_SPEED * dt * 8;
+      p2.vy += (p2my / len) * PLAYER_SPEED * dt * 8;
+      p2.facingX = p2mx / len;
+      p2.facingY = p2my / len;
+    }
+    if ((keys['ShiftRight'] || keys['Numpad0']) && p2.kickCooldown <= 0) {
+      if (ball.owner === p2) {
+        kickBall(p2, p2.facingX, p2.facingY, KICK_POWER, 60);
+      } else {
+        tryPickupBall(p2);
+      }
+    }
+    if (justPressed['Slash'] && p2.kickCooldown <= 0 && ball.owner === p2) {
+      kickBall(p2, p2.facingX, p2.facingY, PASS_POWER, 130);
+    }
+    if (justPressed['ControlRight'] || justPressed['NumpadEnter']) {
+      controlled2 = findClosestPlayer(2, ball.x, ball.y);
+    }
+  }
+}
+
+// ── AI ─────────────────────────────────────────────────────
+function updateAI(dt) {
+  if (gameMode !== '1p') return;
+
+  // Pick the best player to control based on situation
+  if (ball.owner && ball.owner.team === 2) {
+    // We have the ball — controlled2 stays as ball owner
+    const ownerIdx = players2.indexOf(ball.owner);
+    if (ownerIdx >= 0 && players2[ownerIdx].role !== 'GK') controlled2 = ownerIdx;
+  } else {
+    controlled2 = findClosestPlayer(2, ball.x, ball.y);
+  }
+
+  for (let i = 0; i < players2.length; i++) {
+    const p = players2[i];
+
+    if (p.role === 'GK') {
+      // GK: aggressively track ball, stay near goal
+      const targetX = GW - 30;
+      const ballInDanger = ball.x > GW * 0.6;
+      const gkSpeed = ballInDanger ? AI_SPEED * 1.8 : AI_SPEED * 1.3;
+      const targetY = Math.max(GH / 2 - GOAL_DEPTH / 2, Math.min(GH / 2 + GOAL_DEPTH / 2, ball.y));
+      moveToward(p, targetX, targetY, gkSpeed, dt);
+
+      // GK: rush out if ball is very close
+      if (ballInDanger && !ball.owner) {
+        const distToBall = Math.sqrt((ball.x - p.x) ** 2 + (ball.y - p.y) ** 2);
+        if (distToBall < 120) {
+          moveToward(p, ball.x, ball.y, AI_SPEED * 2, dt);
+        }
+      }
+
+      if (!ball.owner && p.kickCooldown <= 0) tryPickupBall(p);
+      if (ball.owner === p) {
+        // GK: kick to a teammate, preferably a forward player
+        let bestTarget = null, bestScore = -Infinity;
+        for (let j = 0; j < players2.length; j++) {
+          if (j === i) continue;
+          const mate = players2[j];
+          const sc = -mate.x + (Math.abs(mate.y - GH / 2) < 100 ? 50 : 0);
+          if (sc > bestScore) { bestScore = sc; bestTarget = mate; }
+        }
+        if (bestTarget) {
+          kickBall(p, bestTarget.x - p.x, bestTarget.y - p.y, KICK_POWER * 0.8, 90);
+        } else {
+          kickBall(p, -1, (Math.random() - 0.5) * 0.8, KICK_POWER * 0.7, 80);
+        }
+      }
+      if (ball.owner && ball.owner.team === 1) tryTackle(p, ball.owner);
+      continue;
+    }
+
+    if (i === controlled2) {
+      // === Active AI player ===
+      if (ball.owner && ball.owner.team === 2 && ball.owner !== p) {
+        // Teammate has ball — make a forward run to receive a pass
+        const runX = Math.min(GW * 0.1, ball.owner.x - 150);
+        const spreadY = (p.y > GH / 2) ? GH * 0.75 : GH * 0.25;
+        moveToward(p, runX, spreadY, AI_SPEED * 1.2, dt);
+      } else if (ball.owner && ball.owner.team === 1) {
+        // Opponent has ball — press aggressively
+        // Predict where the ball carrier is heading
+        const predictX = ball.owner.x + ball.owner.vx * 0.3;
+        const predictY = ball.owner.y + ball.owner.vy * 0.3;
+        moveToward(p, predictX, predictY, AI_SPEED * 1.6, dt);
+        tryTackle(p, ball.owner);
+      } else if (!ball.owner) {
+        // Loose ball — sprint to it
+        const predictX = ball.x + ball.vx * 0.2;
+        const predictY = ball.y + ball.vy * 0.2;
+        moveToward(p, predictX, predictY, AI_SPEED * 1.6, dt);
+        if (p.kickCooldown <= 0) tryPickupBall(p);
+      }
+
+      // If AI has ball — decide: shoot, pass, or dribble
+      if (ball.owner === p) {
+        const goalX = 0, goalY = GH / 2;
+        const distToGoal = Math.sqrt((goalX - p.x) ** 2 + (goalY - p.y) ** 2);
+
+        if (distToGoal < 280) {
+          // Close enough — SHOOT!
+          const gy = GH / 2 + (Math.random() - 0.5) * GOAL_DEPTH * 0.7;
+          const dx = goalX - p.x, dy = gy - p.y;
+          const loft = 15 + Math.random() * 35;
+          kickBall(p, dx, dy, KICK_POWER, loft);
+        } else if (distToGoal < 450) {
+          // Mid-range — look for a pass or dribble
+          let bestMate = null, bestDist = Infinity;
+          for (let j = 0; j < players2.length; j++) {
+            if (j === i || players2[j].role === 'GK') continue;
+            const mate = players2[j];
+            // Prefer teammates closer to goal
+            if (mate.x < p.x) {
+              const md = Math.sqrt((mate.x - goalX) ** 2 + (mate.y - goalY) ** 2);
+              if (md < bestDist) { bestDist = md; bestMate = mate; }
+            }
+          }
+          if (bestMate && Math.random() < 0.4) {
+            // Pass to teammate
+            kickBall(p, bestMate.x - p.x, bestMate.y - p.y, PASS_POWER, 50);
+          } else {
+            // Dribble toward goal
+            moveToward(p, goalX, goalY, AI_SPEED * 1.3, dt);
+            p.facingX = (goalX - p.x); p.facingY = (goalY - p.y);
+            const fl = Math.sqrt(p.facingX ** 2 + p.facingY ** 2);
+            if (fl > 0) { p.facingX /= fl; p.facingY /= fl; }
+          }
+        } else {
+          // Far away — dribble toward goal aggressively
+          moveToward(p, goalX + 100, goalY + (Math.random() - 0.5) * 80, AI_SPEED * 1.3, dt);
+          p.facingX = -1;
+          p.facingY = (GH / 2 - p.y) * 0.005;
+          const fl = Math.sqrt(p.facingX ** 2 + p.facingY ** 2);
+          if (fl > 0) { p.facingX /= fl; p.facingY /= fl; }
+        }
+      }
+    } else {
+      // === Non-active AI: support play ===
+      if (ball.owner && ball.owner.team === 2) {
+        // Teammate has ball — make supporting runs
+        const supportX = ball.owner.x - 80 + (p.homeX < GW / 2 ? -60 : 60);
+        const supportY = p.homeY + (ball.y - GH / 2) * 0.4;
+        moveToward(p, Math.max(30, supportX), supportY, AI_SPEED * 0.9, dt);
+      } else if (ball.owner && ball.owner.team === 1) {
+        // Opponent has ball — track back defensively
+        const defX = Math.max(p.homeX, ball.x + 60);
+        const defY = p.homeY + (ball.y - GH / 2) * 0.35;
+        moveToward(p, defX, defY, AI_SPEED * 1.1, dt);
+        // Nearby players press
+        const distToOwner = Math.sqrt((ball.owner.x - p.x) ** 2 + (ball.owner.y - p.y) ** 2);
+        if (distToOwner < 100) {
+          moveToward(p, ball.owner.x, ball.owner.y, AI_SPEED * 1.4, dt);
+          tryTackle(p, ball.owner);
+        }
+      } else {
+        // Loose ball — drift toward ball biased by formation
+        const targetX = p.homeX * 0.5 + ball.x * 0.5;
+        const targetY = p.homeY * 0.6 + ball.y * 0.4;
+        moveToward(p, targetX, targetY, AI_SPEED * 0.9, dt);
+      }
+
+      // Opportunistic pickup/tackle
+      if (!ball.owner && p.kickCooldown <= 0) tryPickupBall(p);
+      if (ball.owner && ball.owner.team === 1) tryTackle(p, ball.owner);
+
+      // If non-active has ball, pass toward goal or to active player
+      if (ball.owner === p) {
+        const active = players2[controlled2];
+        const goalDist = Math.sqrt(p.x ** 2 + (p.y - GH / 2) ** 2);
+        if (goalDist < 250) {
+          // Close to goal, just shoot
+          kickBall(p, -p.x, GH / 2 - p.y, KICK_POWER * 0.9, 25);
+        } else {
+          const dx = active.x - p.x, dy = active.y - p.y;
+          kickBall(p, dx, dy, PASS_POWER, 50);
+        }
+      }
+    }
+  }
+}
+
+function moveToward(p, tx, ty, speed, dt) {
+  const dx = tx - p.x, dy = ty - p.y;
+  const d = Math.sqrt(dx * dx + dy * dy);
+  if (d > 3) {
+    p.vx += (dx / d) * speed * dt * 10;
+    p.vy += (dy / d) * speed * dt * 10;
+    p.facingX = dx / d;
+    p.facingY = dy / d;
+  }
+}
+
+// ── Non-controlled team AI ─────────────────────────────────
+function updateTeamAI(players, controlledIdx, teamSide, dt) {
+  const attackDir = teamSide === 1 ? 1 : -1;
+  const ownGoalX = teamSide === 1 ? 0 : GW;
+  const oppGoalX = teamSide === 1 ? GW : 0;
+
+  for (let i = 0; i < players.length; i++) {
+    if (i === controlledIdx) continue;
+    const p = players[i];
+
+    if (p.role === 'GK') {
+      const gkX = teamSide === 1 ? 30 : GW - 30;
+      const ballDanger = (teamSide === 1 && ball.x < GW * 0.4) || (teamSide === 2 && ball.x > GW * 0.6);
+      const gkSpeed = ballDanger ? AI_SPEED * 1.6 : AI_SPEED * 1.2;
+      const targetY = Math.max(GH / 2 - GOAL_DEPTH / 2, Math.min(GH / 2 + GOAL_DEPTH / 2, ball.y));
+      moveToward(p, gkX, targetY, gkSpeed, dt);
+
+      // Rush out if ball very close
+      if (ballDanger && !ball.owner) {
+        const d = Math.sqrt((ball.x - p.x) ** 2 + (ball.y - p.y) ** 2);
+        if (d < 120) moveToward(p, ball.x, ball.y, AI_SPEED * 2, dt);
+      }
+
+      if (!ball.owner && p.kickCooldown <= 0) tryPickupBall(p);
+      if (ball.owner === p) {
+        // Kick to a teammate
+        let best = null, bestScore = -Infinity;
+        for (let j = 0; j < players.length; j++) {
+          if (j === i) continue;
+          const sc = (players[j].x - ownGoalX) * attackDir;
+          if (sc > bestScore) { bestScore = sc; best = players[j]; }
+        }
+        if (best) kickBall(p, best.x - p.x, best.y - p.y, KICK_POWER * 0.7, 80);
+        else kickBall(p, attackDir, (Math.random() - 0.5) * 0.6, KICK_POWER * 0.7, 80);
+      }
+      if (ball.owner && ball.owner.team !== teamSide) tryTackle(p, ball.owner);
+      continue;
+    }
+
+    // === Outfield non-controlled ===
+    const teamHasBall = ball.owner && ball.owner.team === teamSide;
+    const oppHasBall = ball.owner && ball.owner.team !== teamSide;
+
+    if (teamHasBall) {
+      // Teammate has ball — make supporting runs ahead of the ball
+      const aheadX = ball.owner.x + attackDir * 120;
+      const spreadY = p.homeY + (ball.y - GH / 2) * 0.3;
+      moveToward(p, Math.max(20, Math.min(GW - 20, aheadX)), spreadY, AI_SPEED * 0.85, dt);
+    } else if (oppHasBall) {
+      // Opponent has ball — track back and press nearby
+      const defX = p.homeX + (ball.x - GW / 2) * 0.35 * -attackDir;
+      const defY = p.homeY + (ball.y - GH / 2) * 0.4;
+      moveToward(p, defX, defY, AI_SPEED * 1.0, dt);
+
+      // Press if close
+      const distToOwner = Math.sqrt((ball.owner.x - p.x) ** 2 + (ball.owner.y - p.y) ** 2);
+      if (distToOwner < 90) {
+        moveToward(p, ball.owner.x, ball.owner.y, AI_SPEED * 1.4, dt);
+        tryTackle(p, ball.owner);
+      }
+    } else {
+      // Loose ball — move toward ball, biased by formation
+      const targetX = p.homeX * 0.4 + ball.x * 0.6;
+      const targetY = p.homeY * 0.5 + ball.y * 0.5;
+      moveToward(p, targetX, targetY, AI_SPEED * 0.9, dt);
+    }
+
+    // Opportunistic actions
+    if (!ball.owner && p.kickCooldown <= 0) tryPickupBall(p);
+    if (oppHasBall) tryTackle(p, ball.owner);
+
+    // If has ball, pass to controlled player or forward
+    if (ball.owner === p) {
+      const active = players[controlledIdx];
+      const dx = active.x - p.x, dy = active.y - p.y;
+      kickBall(p, dx, dy, PASS_POWER, 40);
+    }
+  }
+}
+
+// ── Physics ────────────────────────────────────────────────
+function updatePhysics(dt) {
+  // Ball - if owned, follows owner
+  if (ball.owner) {
+    const p = ball.owner;
+    const offsetDist = 10;
+    ball.x = p.x + p.facingX * offsetDist;
+    ball.y = p.y + p.facingY * offsetDist;
+    ball.z = 0;
+    ball.vx = 0; ball.vy = 0; ball.vz = 0;
+  } else if (!kickoffPending) {
+    ball.x += ball.vx * dt;
+    ball.y += ball.vy * dt;
+    ball.z += ball.vz * dt;
+    ball.vz -= GRAVITY * dt;
+
+    // Ground bounce
+    if (ball.z < 0) {
+      ball.z = 0;
+      ball.vz = -ball.vz * BALL_BOUNCE;
+      if (Math.abs(ball.vz) < 10) ball.vz = 0;
+      // More friction on ground
+      ball.vx *= 0.95;
+      ball.vy *= 0.95;
+    }
+
+    ball.vx *= BALL_FRICTION;
+    ball.vy *= BALL_FRICTION;
+
+    // Sideline bounds (y)
+    if (ball.y < 0) { ball.y = 0; ball.vy *= -0.6; }
+    if (ball.y > GH) { ball.y = GH; ball.vy *= -0.6; }
+
+    // Goal lines (x)
+    const goalY1 = GH / 2 - GOAL_DEPTH / 2;
+    const goalY2 = GH / 2 + GOAL_DEPTH / 2;
+
+    // Left goal line
+    if (ball.x < 0) {
+      if (ball.y > goalY1 && ball.y < goalY2 && ball.z < GOAL_HEIGHT) {
+        triggerGoal(2);
+        return;
+      } else {
+        ball.x = 0; ball.vx *= -0.5;
+      }
+    }
+    // Right goal line
+    if (ball.x > GW) {
+      if (ball.y > goalY1 && ball.y < goalY2 && ball.z < GOAL_HEIGHT) {
+        triggerGoal(1);
+        return;
+      } else {
+        ball.x = GW; ball.vx *= -0.5;
+      }
+    }
+  }
+
+  // Players physics
+  const allPlayers = [...players1, ...players2];
+  for (const p of allPlayers) {
+    p.x += p.vx * dt;
+    p.y += p.vy * dt;
+
+    const speed = Math.sqrt(p.vx * p.vx + p.vy * p.vy);
+    if (speed > 1) p.walkCycle += speed * dt * 0.15;
+
+    p.vx *= 0.87;
+    p.vy *= 0.87;
+    if (p.kickCooldown > 0) p.kickCooldown -= dt;
+
+    // Clamp to pitch (with small margin)
+    p.x = Math.max(-5, Math.min(GW + 5, p.x));
+    p.y = Math.max(0, Math.min(GH, p.y));
+
+    // Try pickup loose ball
+    if (!ball.owner && p.kickCooldown <= 0) {
+      tryPickupBall(p);
+    }
+  }
+
+  // Tackle checks
+  for (const p of allPlayers) {
+    if (ball.owner && ball.owner.team !== p.team && p.kickCooldown <= 0) {
+      tryTackle(p, ball.owner);
+    }
+  }
+
+  // Player-player collision
+  for (let i = 0; i < allPlayers.length; i++) {
+    for (let j = i + 1; j < allPlayers.length; j++) {
+      const a = allPlayers[i], b = allPlayers[j];
+      const dx = b.x - a.x, dy = b.y - a.y;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      const minD = a.r + b.r;
+      if (dist < minD && dist > 0) {
+        const nx = dx / dist, ny = dy / dist;
+        const overlap = minD - dist;
+        a.x -= nx * overlap * 0.5;
+        a.y -= ny * overlap * 0.5;
+        b.x += nx * overlap * 0.5;
+        b.y += ny * overlap * 0.5;
+      }
+    }
+  }
+}
+
+// ── Goal ───────────────────────────────────────────────────
+function triggerGoal(teamNum) {
+  score[teamNum - 1]++;
+  goalScorer = teamNum;
+  goalTimer = 2.5;
+  ball.owner = null;
+  state = 'goal_scored';
+}
+
+// ── Stars ──────────────────────────────────────────────────
+const stars = [];
+for (let i = 0; i < 80; i++) {
+  stars.push({ x: Math.random() * W, y: Math.random() * 100, s: Math.random() * 2 + 0.5, b: Math.random(), speed: Math.random() * 0.3 + 0.1 });
+}
+
+// ── Drawing Helpers ────────────────────────────────────────
+function drawRetroText(text, x, y, size, color, align) {
+  ctx.font = `${size}px 'Press Start 2P', monospace`;
+  ctx.textAlign = align || 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#000';
+  ctx.fillText(text, x + 2, y + 2);
+  ctx.fillStyle = color;
+  ctx.fillText(text, x, y);
+}
+
+function drawStars(time) {
+  for (const s of stars) {
+    const brightness = 0.5 + 0.5 * Math.sin(time * s.speed * 5 + s.b * 10);
+    const c = Math.floor(brightness * 255);
+    ctx.fillStyle = `rgb(${c},${c},${Math.min(255, c + 50)})`;
+    ctx.fillRect(Math.floor(s.x), Math.floor(s.y), Math.ceil(s.s), Math.ceil(s.s));
+  }
+}
+
+// ── Draw Projected Line ────────────────────────────────────
+function drawLine3D(x1, y1, z1, x2, y2, z2, color, width) {
+  const a = project(x1, y1, z1);
+  const b = project(x2, y2, z2);
+  ctx.strokeStyle = color;
+  ctx.lineWidth = width || 1;
+  ctx.beginPath();
+  ctx.moveTo(a.x, a.y);
+  ctx.lineTo(b.x, b.y);
+  ctx.stroke();
+}
+
+function drawQuad3D(points, fillColor, strokeColor) {
+  ctx.beginPath();
+  const p0 = project(points[0][0], points[0][1], points[0][2]);
+  ctx.moveTo(p0.x, p0.y);
+  for (let i = 1; i < points.length; i++) {
+    const pi = project(points[i][0], points[i][1], points[i][2]);
+    ctx.lineTo(pi.x, pi.y);
+  }
+  ctx.closePath();
+  if (fillColor) { ctx.fillStyle = fillColor; ctx.fill(); }
+  if (strokeColor) { ctx.strokeStyle = strokeColor; ctx.lineWidth = 1; ctx.stroke(); }
+}
+
+// ── Draw Pitch (Isometric) ─────────────────────────────────
+function drawPitch() {
+  // Sky gradient behind
+  const grad = ctx.createLinearGradient(0, 0, 0, ISO_OFFSET_Y + 20);
+  grad.addColorStop(0, '#0a0a2a');
+  grad.addColorStop(1, '#1a3a1a');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, W, ISO_OFFSET_Y + 20);
+
+  // Grass surface
+  const corners = [[0, 0, 0], [GW, 0, 0], [GW, GH, 0], [0, GH, 0]];
+  drawQuad3D(corners, '#1a7a2e', null);
+
+  // Grass stripes
+  const stripeW = GW / 12;
+  for (let i = 0; i < 12; i += 2) {
+    const sx = i * stripeW;
+    drawQuad3D(
+      [[sx, 0, 0], [sx + stripeW, 0, 0], [sx + stripeW, GH, 0], [sx, GH, 0]],
+      'rgba(0,0,0,0.04)', null
+    );
+  }
+
+  // Pitch outline
+  drawLine3D(0, 0, 0, GW, 0, 0, 'rgba(255,255,255,0.6)', 2);
+  drawLine3D(GW, 0, 0, GW, GH, 0, 'rgba(255,255,255,0.6)', 2);
+  drawLine3D(GW, GH, 0, 0, GH, 0, 'rgba(255,255,255,0.6)', 2);
+  drawLine3D(0, GH, 0, 0, 0, 0, 'rgba(255,255,255,0.6)', 2);
+
+  // Center line
+  drawLine3D(GW / 2, 0, 0, GW / 2, GH, 0, 'rgba(255,255,255,0.5)', 1.5);
+
+  // Center circle (approximate with segments)
+  const ccR = 65;
+  const ccSegs = 24;
+  for (let i = 0; i < ccSegs; i++) {
+    const a1 = (i / ccSegs) * Math.PI * 2;
+    const a2 = ((i + 1) / ccSegs) * Math.PI * 2;
+    drawLine3D(
+      GW / 2 + Math.cos(a1) * ccR, GH / 2 + Math.sin(a1) * ccR, 0,
+      GW / 2 + Math.cos(a2) * ccR, GH / 2 + Math.sin(a2) * ccR, 0,
+      'rgba(255,255,255,0.5)', 1.5
+    );
+  }
+
+  // Penalty areas
+  const paW = 100, paH = 220;
+  drawLine3D(0, GH / 2 - paH / 2, 0, paW, GH / 2 - paH / 2, 0, 'rgba(255,255,255,0.5)', 1.5);
+  drawLine3D(paW, GH / 2 - paH / 2, 0, paW, GH / 2 + paH / 2, 0, 'rgba(255,255,255,0.5)', 1.5);
+  drawLine3D(paW, GH / 2 + paH / 2, 0, 0, GH / 2 + paH / 2, 0, 'rgba(255,255,255,0.5)', 1.5);
+
+  drawLine3D(GW, GH / 2 - paH / 2, 0, GW - paW, GH / 2 - paH / 2, 0, 'rgba(255,255,255,0.5)', 1.5);
+  drawLine3D(GW - paW, GH / 2 - paH / 2, 0, GW - paW, GH / 2 + paH / 2, 0, 'rgba(255,255,255,0.5)', 1.5);
+  drawLine3D(GW - paW, GH / 2 + paH / 2, 0, GW, GH / 2 + paH / 2, 0, 'rgba(255,255,255,0.5)', 1.5);
+}
+
+// ── Draw Goals (3D with posts, crossbar, net) ──────────────
+function drawGoalBack(side) {
+  const gx = side === 'left' ? 0 : GW;
+  const gy1 = GH / 2 - GOAL_DEPTH / 2;
+  const gy2 = GH / 2 + GOAL_DEPTH / 2;
+  const netX = side === 'left' ? gx - GOAL_NET_DEPTH : gx + GOAL_NET_DEPTH;
+
+  // Net back face
+  drawQuad3D(
+    [[netX, gy1, 0], [netX, gy2, 0], [netX, gy2, GOAL_HEIGHT], [netX, gy1, GOAL_HEIGHT]],
+    'rgba(255,255,255,0.08)', 'rgba(255,255,255,0.15)'
+  );
+
+  // Net top face
+  drawQuad3D(
+    [[gx, gy1, GOAL_HEIGHT], [gx, gy2, GOAL_HEIGHT], [netX, gy2, GOAL_HEIGHT], [netX, gy1, GOAL_HEIGHT]],
+    'rgba(255,255,255,0.06)', 'rgba(255,255,255,0.12)'
+  );
+
+  // Net side faces
+  drawQuad3D(
+    [[gx, gy1, 0], [netX, gy1, 0], [netX, gy1, GOAL_HEIGHT], [gx, gy1, GOAL_HEIGHT]],
+    'rgba(255,255,255,0.05)', 'rgba(255,255,255,0.1)'
+  );
+  drawQuad3D(
+    [[gx, gy2, 0], [netX, gy2, 0], [netX, gy2, GOAL_HEIGHT], [gx, gy2, GOAL_HEIGHT]],
+    'rgba(255,255,255,0.05)', 'rgba(255,255,255,0.1)'
+  );
+
+  // Net mesh lines
+  ctx.strokeStyle = 'rgba(255,255,255,0.1)';
+  ctx.lineWidth = 0.5;
+  for (let z = 0; z <= GOAL_HEIGHT; z += 12) {
+    drawLine3D(netX, gy1, z, netX, gy2, z, 'rgba(255,255,255,0.1)', 0.5);
+  }
+  for (let y = gy1; y <= gy2; y += 12) {
+    drawLine3D(netX, y, 0, netX, y, GOAL_HEIGHT, 'rgba(255,255,255,0.1)', 0.5);
+  }
+}
+
+function drawGoalFront(side) {
+  const gx = side === 'left' ? 0 : GW;
+  const gy1 = GH / 2 - GOAL_DEPTH / 2;
+  const gy2 = GH / 2 + GOAL_DEPTH / 2;
+
+  // Posts
+  drawLine3D(gx, gy1, 0, gx, gy1, GOAL_HEIGHT, '#fff', 3);
+  drawLine3D(gx, gy2, 0, gx, gy2, GOAL_HEIGHT, '#fff', 3);
+  // Crossbar
+  drawLine3D(gx, gy1, GOAL_HEIGHT, gx, gy2, GOAL_HEIGHT, '#fff', 3);
+}
+
+// ── Draw Player (Little Retro Person) ──────────────────────
+function drawPlayerSprite(p, teamIdx, isControlled, time) {
+  const t = TEAMS[teamIdx];
+  const sp = project(p.x, p.y, 0);
+  const sx = sp.x, sy = sp.y;
+
+  // Scale based on depth (further = smaller for pseudo-perspective)
+  const depthScale = 0.7 + 0.3 * (p.y / GH);
+  const s = depthScale;
+
+  const isGK = p.role === 'GK';
+  const shirtColor = isGK ? t.gk : t.primary;
+  const shortsColor = isGK ? '#222' : t.secondary;
+  const skinColor = '#EDBB7A';
+  const bootColor = '#222';
+  const sockColor = '#fff';
+
+  // Walk animation
+  const speed = Math.sqrt(p.vx * p.vx + p.vy * p.vy);
+  const walking = speed > 8;
+  const legSwing = walking ? Math.sin(p.walkCycle) * 4 * s : 0;
+  const armSwing = walking ? Math.sin(p.walkCycle) * 3 * s : 0;
+
+  // Shadow on ground
+  ctx.fillStyle = 'rgba(0,0,0,0.25)';
+  ctx.beginPath();
+  ctx.ellipse(sx, sy + 1 * s, 7 * s, 3 * s, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Control indicator (arrow above)
+  if (isControlled) {
+    const bobY = Math.sin(time * 5) * 2;
+    ctx.fillStyle = '#FFD700';
+    ctx.beginPath();
+    ctx.moveTo(sx, sy - 30 * s + bobY);
+    ctx.lineTo(sx - 4 * s, sy - 36 * s + bobY);
+    ctx.lineTo(sx + 4 * s, sy - 36 * s + bobY);
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  // Possession glow
+  if (ball.owner === p) {
+    ctx.strokeStyle = 'rgba(255,215,0,0.6)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(sx, sy - 10 * s, 14 * s, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+
+  // === Draw the little person ===
+
+  // Legs (two lines from torso bottom)
+  const torsoBottom = sy - 4 * s;
+  const footY = sy - 1 * s;
+
+  // Left leg
+  ctx.strokeStyle = sockColor;
+  ctx.lineWidth = Math.max(2, 2.5 * s);
+  ctx.beginPath();
+  ctx.moveTo(sx - 3 * s, torsoBottom);
+  ctx.lineTo(sx - 3 * s - legSwing, footY);
+  ctx.stroke();
+
+  // Right leg
+  ctx.beginPath();
+  ctx.moveTo(sx + 3 * s, torsoBottom);
+  ctx.lineTo(sx + 3 * s + legSwing, footY);
+  ctx.stroke();
+
+  // Boots
+  ctx.strokeStyle = bootColor;
+  ctx.lineWidth = Math.max(2, 3 * s);
+  ctx.beginPath();
+  ctx.moveTo(sx - 3 * s - legSwing, footY);
+  ctx.lineTo(sx - 3 * s - legSwing, footY + 1.5 * s);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(sx + 3 * s + legSwing, footY);
+  ctx.lineTo(sx + 3 * s + legSwing, footY + 1.5 * s);
+  ctx.stroke();
+
+  // Shorts
+  ctx.fillStyle = shortsColor;
+  ctx.fillRect(sx - 5 * s, torsoBottom - 3 * s, 10 * s, 5 * s);
+
+  // Torso (shirt)
+  ctx.fillStyle = shirtColor;
+  ctx.fillRect(sx - 5 * s, torsoBottom - 11 * s, 10 * s, 9 * s);
+
+  // Shirt detail (stripe or secondary color band)
+  if (!isGK) {
+    ctx.fillStyle = t.secondary;
+    ctx.fillRect(sx - 5 * s, torsoBottom - 8 * s, 10 * s, 3 * s);
+  }
+
+  // Shirt outline
+  ctx.strokeStyle = 'rgba(0,0,0,0.4)';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(sx - 5 * s, torsoBottom - 11 * s, 10 * s, 9 * s);
+
+  // Arms
+  ctx.strokeStyle = skinColor;
+  ctx.lineWidth = Math.max(1.5, 2 * s);
+  // Left arm
+  ctx.beginPath();
+  ctx.moveTo(sx - 5 * s, torsoBottom - 9 * s);
+  ctx.lineTo(sx - 8 * s + armSwing, torsoBottom - 4 * s);
+  ctx.stroke();
+  // Right arm
+  ctx.beginPath();
+  ctx.moveTo(sx + 5 * s, torsoBottom - 9 * s);
+  ctx.lineTo(sx + 8 * s - armSwing, torsoBottom - 4 * s);
+  ctx.stroke();
+
+  // Head
+  const headY = torsoBottom - 15 * s;
+  ctx.fillStyle = skinColor;
+  ctx.beginPath();
+  ctx.arc(sx, headY, 4.5 * s, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(0,0,0,0.3)';
+  ctx.lineWidth = 1;
+  ctx.stroke();
+
+  // Hair (dark top)
+  ctx.fillStyle = '#3a2a1a';
+  ctx.beginPath();
+  ctx.arc(sx, headY - 1.5 * s, 4.5 * s, Math.PI, Math.PI * 2);
+  ctx.fill();
+
+  // Number on back (small)
+  if (s > 0.6) {
+    ctx.font = `${Math.max(5, Math.floor(6 * s))}px 'Press Start 2P', monospace`;
+    ctx.fillStyle = 'rgba(255,255,255,0.7)';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+  }
+}
+
+// ── Draw Ball (with height / shadow) ───────────────────────
+function drawBallSprite() {
+  // Shadow on ground
+  const groundPos = project(ball.x, ball.y, 0);
+  const ballPos = project(ball.x, ball.y, ball.z);
+
+  const shadowScale = Math.max(0.3, 1 - ball.z / 120);
+  ctx.fillStyle = `rgba(0,0,0,${0.3 * shadowScale})`;
+  ctx.beginPath();
+  ctx.ellipse(groundPos.x, groundPos.y, 5 * shadowScale, 2.5 * shadowScale, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Dotted line from shadow to ball if airborne
+  if (ball.z > 5) {
+    ctx.strokeStyle = 'rgba(255,255,255,0.15)';
+    ctx.setLineDash([2, 3]);
+    ctx.beginPath();
+    ctx.moveTo(groundPos.x, groundPos.y);
+    ctx.lineTo(ballPos.x, ballPos.y);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  // Ball
+  const br = 4 + (ball.z > 0 ? 1 : 0);
+  ctx.fillStyle = '#fff';
+  ctx.strokeStyle = '#333';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.arc(ballPos.x, ballPos.y, br, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+
+  // Pentagon pattern
+  ctx.fillStyle = '#333';
+  ctx.beginPath();
+  ctx.arc(ballPos.x - 1, ballPos.y - 1, br * 0.35, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+// ── Draw HUD ───────────────────────────────────────────────
+function drawHUD() {
+  ctx.fillStyle = 'rgba(0,0,0,0.8)';
+  ctx.fillRect(W / 2 - 200, 2, 400, 34);
+  ctx.strokeStyle = '#FFD700';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(W / 2 - 200, 2, 400, 34);
+
+  const t1 = TEAMS[team1Idx], t2 = TEAMS[team2Idx];
+  drawRetroText(t1.short, W / 2 - 120, 19, 10, t1.primary === '#FFFFFF' ? '#ddd' : t1.primary);
+  drawRetroText(`${score[0]}`, W / 2 - 50, 19, 14, '#FFD700');
+  drawRetroText('-', W / 2, 19, 14, '#fff');
+  drawRetroText(`${score[1]}`, W / 2 + 50, 19, 14, '#FFD700');
+  drawRetroText(t2.short, W / 2 + 120, 19, 10, t2.primary === '#FFFFFF' ? '#ddd' : t2.primary);
+
+  const totalSecs = Math.floor(matchTimer);
+  const mins = Math.floor(totalSecs / 60);
+  const secs = totalSecs % 60;
+  const displayMins = half === 1 ? mins : mins + 45;
+  const timeStr = `${String(displayMins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+  drawRetroText(timeStr, W / 2, H - 12, 10, '#0f0');
+  drawRetroText(half === 1 ? '1ST HALF' : '2ND HALF', W / 2, H - 28, 7, '#aaa');
+
+  if (gameMode === '2p') {
+    drawRetroText('P1:WASD+SPACE E:LOB Q:SWITCH', 160, H - 12, 5, '#555', 'center');
+    drawRetroText('P2:ARROWS+RSHIFT /:LOB RCTRL:SW', W - 170, H - 12, 5, '#555', 'center');
+  } else {
+    drawRetroText('ARROWS+SPACE  LSHIFT:LOB  Z:SWITCH', 180, H - 12, 5, '#555', 'center');
+  }
+}
+
+// ── Menu Screens ───────────────────────────────────────────
+function drawMenuBackground(time) {
+  ctx.fillStyle = '#0a0a1a';
+  ctx.fillRect(0, 0, W, H);
+  drawStars(time);
+  for (let y = 0; y < H; y += 3) {
+    ctx.fillStyle = 'rgba(0,0,0,0.15)';
+    ctx.fillRect(0, y, W, 1);
+  }
+}
+
+function drawMenuMode(time) {
+  drawMenuBackground(time);
+  const titleY = 80;
+  ctx.shadowColor = '#FFD700'; ctx.shadowBlur = 20;
+  drawRetroText('STAR', W / 2, titleY, 36, '#FFD700');
+  ctx.shadowBlur = 10;
+  drawRetroText('FOOTBALL', W / 2, titleY + 50, 28, '#fff');
+  ctx.shadowBlur = 0;
+  drawRetroText('RETRO EDITION', W / 2, titleY + 90, 10, '#0f0');
+
+  // Decorative ball
+  const bx = W / 2, by = titleY + 140;
+  ctx.fillStyle = '#fff';
+  ctx.beginPath(); ctx.arc(bx, by, 12, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = '#333';
+  ctx.beginPath(); ctx.arc(bx - 2, by - 2, 4, 0, Math.PI * 2); ctx.fill();
+
+  const optY = 300;
+  const modes = ['1 PLAYER  VS  CPU', '2 PLAYERS'];
+  for (let i = 0; i < modes.length; i++) {
+    const sel = menuCursor === i;
+    const y = optY + i * 45;
+    if (sel) {
+      ctx.fillStyle = 'rgba(255,215,0,0.15)';
+      ctx.fillRect(W / 2 - 180, y - 15, 360, 30);
+      drawRetroText('>', W / 2 - 170, y, 14, '#FFD700');
+      drawRetroText(modes[i], W / 2, y, 12, '#FFD700');
+    } else {
+      drawRetroText(modes[i], W / 2, y, 12, '#888');
+    }
+  }
+  drawRetroText('USE W/S OR ARROWS TO SELECT', W / 2, H - 60, 7, '#555');
+  drawRetroText('PRESS ENTER OR SPACE TO CONFIRM', W / 2, H - 40, 7, '#555');
+}
+
+function drawMenuTeam(teamNum, time) {
+  drawMenuBackground(time);
+  const label = teamNum === 1 ? 'PLAYER 1' : (gameMode === '1p' && teamNum === 2 ? 'CPU' : 'PLAYER 2');
+  drawRetroText(`${label} - CHOOSE TEAM`, W / 2, 40, 12, '#FFD700');
+
+  const startIdx = Math.max(0, Math.min(menuCursor - 3, TEAMS.length - 8));
+  const visibleCount = Math.min(8, TEAMS.length);
+
+  for (let vi = 0; vi < visibleCount; vi++) {
+    const i = startIdx + vi;
+    if (i >= TEAMS.length) break;
+    const selected = menuCursor === i;
+    const disabled = teamNum === 2 && i === team1Idx;
+    const y = 80 + vi * 45;
+
+    if (disabled) { drawRetroText(TEAMS[i].name, W / 2, y, 10, '#333'); continue; }
+    if (selected) {
+      ctx.fillStyle = 'rgba(255,215,0,0.12)';
+      ctx.fillRect(W / 2 - 220, y - 14, 440, 28);
+      drawRetroText('>', W / 2 - 210, y, 12, '#FFD700');
+
+      // Team color preview (little shirt)
+      const px = W / 2 + 185;
+      ctx.fillStyle = TEAMS[i].primary;
+      ctx.fillRect(px - 6, y - 8, 12, 10);
+      ctx.fillStyle = TEAMS[i].secondary;
+      ctx.fillRect(px - 6, y - 3, 12, 3);
+      ctx.strokeStyle = '#000'; ctx.lineWidth = 1;
+      ctx.strokeRect(px - 6, y - 8, 12, 10);
+
+      drawRetroText(TEAMS[i].name, W / 2, y, 11, '#FFD700');
+    } else {
+      drawRetroText(TEAMS[i].name, W / 2, y, 10, '#aaa');
+    }
+  }
+  if (startIdx > 0) drawRetroText('^', W / 2, 68, 10, '#555');
+  if (startIdx + visibleCount < TEAMS.length) drawRetroText('v', W / 2, 80 + visibleCount * 45, 10, '#555');
+  drawRetroText('ESC TO GO BACK', W / 2, H - 30, 7, '#555');
+}
+
+function drawGoalCelebration(time) {
+  const team = goalScorer === 1 ? TEAMS[team1Idx] : TEAMS[team2Idx];
+  const flash = Math.sin(time * 10) > 0;
+  if (flash) {
+    ctx.fillStyle = 'rgba(255,255,255,0.1)';
+    ctx.fillRect(0, 0, W, H);
+  }
+  ctx.shadowColor = team.primary; ctx.shadowBlur = 30;
+  drawRetroText('GOAL!', W / 2, H / 2 - 20, 40, flash ? '#FFD700' : team.primary);
+  ctx.shadowBlur = 0;
+  drawRetroText(team.name, W / 2, H / 2 + 30, 14, '#fff');
+}
+
+function drawHalftime() {
+  ctx.fillStyle = 'rgba(0,0,0,0.85)';
+  ctx.fillRect(0, 0, W, H);
+  drawRetroText('HALF TIME', W / 2, H / 2 - 60, 24, '#FFD700');
+  drawRetroText(`${TEAMS[team1Idx].short}  ${score[0]} - ${score[1]}  ${TEAMS[team2Idx].short}`, W / 2, H / 2, 16, '#fff');
+  drawRetroText('PRESS ENTER TO CONTINUE', W / 2, H / 2 + 60, 9, '#0f0');
+}
+
+function drawFulltime() {
+  ctx.fillStyle = 'rgba(0,0,0,0.9)';
+  ctx.fillRect(0, 0, W, H);
+  drawRetroText('FULL TIME', W / 2, H / 2 - 80, 24, '#FFD700');
+  drawRetroText(`${TEAMS[team1Idx].short}  ${score[0]} - ${score[1]}  ${TEAMS[team2Idx].short}`, W / 2, H / 2 - 20, 18, '#fff');
+  let result = 'DRAW!', color = '#FFD700';
+  if (score[0] > score[1]) { result = `${TEAMS[team1Idx].name} WINS!`; color = TEAMS[team1Idx].primary === '#FFFFFF' ? '#ddd' : TEAMS[team1Idx].primary; }
+  else if (score[1] > score[0]) { result = `${TEAMS[team2Idx].name} WINS!`; color = TEAMS[team2Idx].primary === '#FFFFFF' ? '#ddd' : TEAMS[team2Idx].primary; }
+  ctx.shadowColor = color; ctx.shadowBlur = 15;
+  drawRetroText(result, W / 2, H / 2 + 30, 14, color);
+  ctx.shadowBlur = 0;
+  drawRetroText('PRESS ENTER FOR MENU', W / 2, H / 2 + 80, 9, '#0f0');
+}
+
+// ── Main Draw (Playing) ───────────────────────────────────
+function drawGameScene(time) {
+  // Background
+  ctx.fillStyle = '#0a0a1a';
+  ctx.fillRect(0, 0, W, H);
+
+  // Crowd/stands behind pitch (far side)
+  const standColor = '#1a1a2a';
+  const p1 = project(0, 0, 0);
+  const p2 = project(GW, 0, 0);
+  ctx.fillStyle = standColor;
+  ctx.fillRect(0, 0, W, Math.max(p1.y, p2.y));
+
+  // Crowd dots (far side)
+  const crowdY = p1.y;
+  for (let cx = 0; cx < W; cx += 6) {
+    for (let cy = crowdY - 50; cy < crowdY - 5; cy += 5) {
+      const hue = ((cx * 7 + cy * 13) % 360);
+      const bright = 30 + ((cx * 3 + cy * 7) % 30);
+      ctx.fillStyle = `hsl(${hue}, 60%, ${bright}%)`;
+      ctx.fillRect(cx, cy, 3, 3);
+    }
+  }
+
+  // Stars in sky
+  drawStars(time);
+
+  // Draw pitch
+  drawPitch();
+
+  // Draw goal backs (nets) - drawn before players
+  drawGoalBack('left');
+  drawGoalBack('right');
+
+  // Collect all drawable entities and sort by depth (y)
+  const entities = [];
+  for (let i = 0; i < players1.length; i++) {
+    entities.push({ type: 'player', data: players1[i], idx: i, teamIdx: team1Idx, controlled: i === controlled1 });
+  }
+  for (let i = 0; i < players2.length; i++) {
+    entities.push({ type: 'player', data: players2[i], idx: i, teamIdx: team2Idx, controlled: (gameMode === '2p' || gameMode === '1p') && i === controlled2 });
+  }
+  entities.push({ type: 'ball', data: ball });
+
+  // Sort: lower y (farther) drawn first
+  entities.sort((a, b) => {
+    const ay = a.type === 'ball' ? a.data.y : a.data.y;
+    const by = b.type === 'ball' ? b.data.y : b.data.y;
+    return ay - by;
+  });
+
+  // Draw sorted entities
+  for (const e of entities) {
+    if (e.type === 'player') {
+      drawPlayerSprite(e.data, e.teamIdx, e.controlled, time);
+    } else {
+      if (!ball.owner) drawBallSprite();
+    }
+  }
+
+  // If ball is owned, draw it after the owner
+  if (ball.owner) drawBallSprite();
+
+  // Draw goal fronts (posts/crossbar) - drawn after players for near-side overlap
+  drawGoalFront('left');
+  drawGoalFront('right');
+
+  // Scanlines
+  for (let y = 0; y < H; y += 4) {
+    ctx.fillStyle = 'rgba(0,0,0,0.05)';
+    ctx.fillRect(0, y, W, 1);
+  }
+}
+
+// ── Main Loop ──────────────────────────────────────────────
+function gameLoop(timestamp) {
+  const dt = Math.min((timestamp - lastTime) / 1000, 0.05);
+  lastTime = timestamp;
+  const time = timestamp / 1000;
+
+  // Clear justPressed at end of frame
+  const clearJustPressed = () => { for (const k in justPressed) delete justPressed[k]; };
+
+  if (state === 'menu_mode') {
+    drawMenuMode(time);
+  } else if (state === 'menu_team1') {
+    drawMenuTeam(1, time);
+  } else if (state === 'menu_team2') {
+    drawMenuTeam(2, time);
+  } else if (state === 'playing') {
+    if (kickoffPending) {
+      kickoffTimer -= dt;
+      if (kickoffTimer <= 0) kickoffPending = false;
+    }
+    if (!kickoffPending) matchTimer += dt;
+
+    updatePlayerControl(dt);
+    updateAI(dt);
+    updateTeamAI(players1, controlled1, 1, dt);
+    if (gameMode === '2p') {
+      updateTeamAI(players2, controlled2, 2, dt);
+    }
+    updatePhysics(dt);
+
+    // Auto-switch to closest player (only if no one on team has ball)
+    const team1HasBall = ball.owner && ball.owner.team === 1;
+    const team2HasBall = ball.owner && ball.owner.team === 2;
+    if (!team1HasBall) controlled1 = findClosestPlayer(1, ball.x, ball.y);
+    else {
+      // Switch to ball owner
+      const ownerIdx = players1.indexOf(ball.owner);
+      if (ownerIdx >= 0) controlled1 = ownerIdx;
+    }
+    if (gameMode === '2p') {
+      if (!team2HasBall) controlled2 = findClosestPlayer(2, ball.x, ball.y);
+      else {
+        const ownerIdx = players2.indexOf(ball.owner);
+        if (ownerIdx >= 0) controlled2 = ownerIdx;
+      }
+    }
+
+    if (matchTimer >= HALF_DURATION) {
+      if (half === 1) state = 'halftime';
+      else state = 'fulltime';
+    }
+
+    drawGameScene(time);
+    drawHUD();
+    if (kickoffPending) drawRetroText('KICK OFF!', W / 2, H / 2 - 40, 16, '#FFD700');
+
+  } else if (state === 'goal_scored') {
+    goalTimer -= dt;
+    drawGameScene(time);
+    drawHUD();
+    drawGoalCelebration(time);
+    if (goalTimer <= 0) {
+      resetForKickoff();
+      state = 'playing';
+    }
+  } else if (state === 'halftime') {
+    ctx.fillStyle = '#0a0a1a'; ctx.fillRect(0, 0, W, H);
+    drawStars(time);
+    drawHalftime();
+  } else if (state === 'fulltime') {
+    ctx.fillStyle = '#0a0a1a'; ctx.fillRect(0, 0, W, H);
+    drawStars(time);
+    drawFulltime();
+  }
+
+  clearJustPressed();
+  requestAnimationFrame(gameLoop);
+}
+
+// ── Start ──────────────────────────────────────────────────
+lastTime = performance.now();
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
