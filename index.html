@@ -36,7 +36,7 @@
 const canvas = document.getElementById('game');
 const ctx = canvas.getContext('2d');
 
-const W = 1200, H = 750;
+const W = 1200, H = 950;
 canvas.width = W;
 canvas.height = H;
 
@@ -88,9 +88,9 @@ document.addEventListener('keyup', e => {
 //        y = depth into pitch (0 = near sideline, GH = far sideline)
 //        z = height above ground
 const GW = 840; // pitch width in world units
-const GH = 520; // pitch depth in world units
+const GH = 780; // pitch depth in world units
 const GOAL_HEIGHT = 55; // goal height in world z-units
-const GOAL_DEPTH = 110; // goal width on y-axis (centered)
+const GOAL_DEPTH = 140; // goal width on y-axis (centered)
 const GOAL_NET_DEPTH = 35; // how far back the net goes
 
 // ── Isometric Projection ───────────────────────────────────
@@ -132,7 +132,7 @@ function resetBall() {
 const PLAYER_SPEED = 170;
 const KICK_POWER = 380;
 const PASS_POWER = 280;
-const AI_SPEED = 175;
+const AI_SPEED = 105;
 const TACKLE_DIST = 22;
 const POSSESS_DIST = 20;
 
@@ -142,10 +142,10 @@ function createTeamPlayers(teamSide) {
   const cy = GH / 2;
   const positions = [
     { x: cx + dir * 30,  y: cy, role: 'GK' },
-    { x: cx + dir * 170, y: cy - 120, role: 'DEF' },
-    { x: cx + dir * 170, y: cy + 120, role: 'DEF2' },
-    { x: cx + dir * 330, y: cy - 70, role: 'MID' },
-    { x: cx + dir * 480, y: cy + 40, role: 'FWD' },
+    { x: cx + dir * 170, y: cy - 180, role: 'DEF' },
+    { x: cx + dir * 170, y: cy + 180, role: 'DEF2' },
+    { x: cx + dir * 330, y: cy - 100, role: 'MID' },
+    { x: cx + dir * 480, y: cy + 60, role: 'FWD' },
   ];
   return positions.map(p => ({
     x: p.x, y: p.y, z: 0,
@@ -283,6 +283,63 @@ function kickBall(player, dirX, dirY, power, loft) {
   if (kickoffPending) kickoffPending = false;
 }
 
+// ── Smart Kick: pass to teammate in arrow direction, or shoot if near goal ──
+function smartKick(player, dirX, dirY, teammates, teamSide) {
+  const oppGoalX = teamSide === 1 ? GW : 0;
+  const oppGoalY = GH / 2;
+  const distToGoal = Math.sqrt((oppGoalX - player.x) ** 2 + (oppGoalY - player.y) ** 2);
+
+  // Normalize direction
+  let ndx = dirX, ndy = dirY;
+  const dlen = Math.sqrt(ndx * ndx + ndy * ndy);
+  if (dlen > 0) { ndx /= dlen; ndy /= dlen; }
+
+  // Check if facing roughly toward the goal and close enough — SHOOT
+  const toGoalX = oppGoalX - player.x, toGoalY = oppGoalY - player.y;
+  const toGoalLen = Math.sqrt(toGoalX * toGoalX + toGoalY * toGoalY);
+  const goalDotProduct = (ndx * toGoalX / toGoalLen) + (ndy * toGoalY / toGoalLen);
+
+  if (distToGoal < 300 && goalDotProduct > 0.5) {
+    // Shoot at goal — aim at a random spot within the goal mouth
+    const targetY = oppGoalY + (Math.random() - 0.5) * GOAL_DEPTH * 0.7;
+    const sx = oppGoalX - player.x, sy = targetY - player.y;
+    kickBall(player, sx, sy, KICK_POWER, 15 + Math.random() * 25);
+    return;
+  }
+
+  // Otherwise — find the best teammate in the direction we're pressing
+  let bestMate = null, bestScore = -Infinity;
+  for (const mate of teammates) {
+    if (mate === player) continue;
+    if (mate.role === 'GK') continue; // don't pass back to GK unless no other option
+    const mx = mate.x - player.x, my = mate.y - player.y;
+    const mLen = Math.sqrt(mx * mx + my * my);
+    if (mLen < 20) continue; // too close, skip
+
+    // Dot product: how well does this teammate align with our arrow direction?
+    const dot = (ndx * mx / mLen) + (ndy * my / mLen);
+    // Score: strong preference for direction alignment, slight preference for closer
+    const score = dot * 100 - mLen * 0.05;
+    if (dot > 0.2 && score > bestScore) {
+      bestScore = score;
+      bestMate = mate;
+    }
+  }
+
+  if (bestMate) {
+    // Pass to that teammate — lead the pass slightly
+    const tx = bestMate.x + bestMate.vx * 0.3;
+    const ty = bestMate.y + bestMate.vy * 0.3;
+    const px = tx - player.x, py = ty - player.y;
+    const dist = Math.sqrt(px * px + py * py);
+    const power = Math.min(PASS_POWER, Math.max(180, dist * 0.7));
+    kickBall(player, px, py, power, 20 + dist * 0.05);
+  } else {
+    // No good teammate found — just kick in facing direction
+    kickBall(player, ndx, ndy, KICK_POWER * 0.7, 40);
+  }
+}
+
 // ── Player Control ─────────────────────────────────────────
 function updatePlayerControl(dt) {
   const p1 = players1[controlled1];
@@ -310,10 +367,10 @@ function updatePlayerControl(dt) {
     p1.facingY = p1my / len;
   }
 
-  // Kick / shoot
+  // Kick / shoot — smart pass to teammate in arrow direction, or shoot near goal
   if (keys['Space'] && p1.kickCooldown <= 0) {
     if (ball.owner === p1) {
-      kickBall(p1, p1.facingX, p1.facingY, KICK_POWER, 60);
+      smartKick(p1, p1.facingX, p1.facingY, players1, 1);
     } else {
       tryPickupBall(p1);
     }
@@ -348,7 +405,7 @@ function updatePlayerControl(dt) {
     }
     if ((keys['ShiftRight'] || keys['Numpad0']) && p2.kickCooldown <= 0) {
       if (ball.owner === p2) {
-        kickBall(p2, p2.facingX, p2.facingY, KICK_POWER, 60);
+        smartKick(p2, p2.facingX, p2.facingY, players2, 2);
       } else {
         tryPickupBall(p2);
       }
@@ -382,7 +439,7 @@ function updateAI(dt) {
       // GK: aggressively track ball, stay near goal
       const targetX = GW - 30;
       const ballInDanger = ball.x > GW * 0.6;
-      const gkSpeed = ballInDanger ? AI_SPEED * 1.8 : AI_SPEED * 1.3;
+      const gkSpeed = ballInDanger ? AI_SPEED * 1.4 : AI_SPEED * 1.1;
       const targetY = Math.max(GH / 2 - GOAL_DEPTH / 2, Math.min(GH / 2 + GOAL_DEPTH / 2, ball.y));
       moveToward(p, targetX, targetY, gkSpeed, dt);
 
@@ -390,7 +447,7 @@ function updateAI(dt) {
       if (ballInDanger && !ball.owner) {
         const distToBall = Math.sqrt((ball.x - p.x) ** 2 + (ball.y - p.y) ** 2);
         if (distToBall < 120) {
-          moveToward(p, ball.x, ball.y, AI_SPEED * 2, dt);
+          moveToward(p, ball.x, ball.y, AI_SPEED * 1.5, dt);
         }
       }
 
@@ -420,19 +477,18 @@ function updateAI(dt) {
         // Teammate has ball — make a forward run to receive a pass
         const runX = Math.min(GW * 0.1, ball.owner.x - 150);
         const spreadY = (p.y > GH / 2) ? GH * 0.75 : GH * 0.25;
-        moveToward(p, runX, spreadY, AI_SPEED * 1.2, dt);
+        moveToward(p, runX, spreadY, AI_SPEED * 1.0, dt);
       } else if (ball.owner && ball.owner.team === 1) {
-        // Opponent has ball — press aggressively
-        // Predict where the ball carrier is heading
-        const predictX = ball.owner.x + ball.owner.vx * 0.3;
-        const predictY = ball.owner.y + ball.owner.vy * 0.3;
-        moveToward(p, predictX, predictY, AI_SPEED * 1.6, dt);
+        // Opponent has ball — press
+        const predictX = ball.owner.x + ball.owner.vx * 0.2;
+        const predictY = ball.owner.y + ball.owner.vy * 0.2;
+        moveToward(p, predictX, predictY, AI_SPEED * 1.2, dt);
         tryTackle(p, ball.owner);
       } else if (!ball.owner) {
-        // Loose ball — sprint to it
-        const predictX = ball.x + ball.vx * 0.2;
-        const predictY = ball.y + ball.vy * 0.2;
-        moveToward(p, predictX, predictY, AI_SPEED * 1.6, dt);
+        // Loose ball — chase it
+        const predictX = ball.x + ball.vx * 0.15;
+        const predictY = ball.y + ball.vy * 0.15;
+        moveToward(p, predictX, predictY, AI_SPEED * 1.2, dt);
         if (p.kickCooldown <= 0) tryPickupBall(p);
       }
 
@@ -459,19 +515,19 @@ function updateAI(dt) {
               if (md < bestDist) { bestDist = md; bestMate = mate; }
             }
           }
-          if (bestMate && Math.random() < 0.4) {
+          if (bestMate && Math.random() < 0.3) {
             // Pass to teammate
             kickBall(p, bestMate.x - p.x, bestMate.y - p.y, PASS_POWER, 50);
           } else {
             // Dribble toward goal
-            moveToward(p, goalX, goalY, AI_SPEED * 1.3, dt);
+            moveToward(p, goalX, goalY, AI_SPEED * 1.0, dt);
             p.facingX = (goalX - p.x); p.facingY = (goalY - p.y);
             const fl = Math.sqrt(p.facingX ** 2 + p.facingY ** 2);
             if (fl > 0) { p.facingX /= fl; p.facingY /= fl; }
           }
         } else {
           // Far away — dribble toward goal aggressively
-          moveToward(p, goalX + 100, goalY + (Math.random() - 0.5) * 80, AI_SPEED * 1.3, dt);
+          moveToward(p, goalX + 100, goalY + (Math.random() - 0.5) * 80, AI_SPEED * 1.0, dt);
           p.facingX = -1;
           p.facingY = (GH / 2 - p.y) * 0.005;
           const fl = Math.sqrt(p.facingX ** 2 + p.facingY ** 2);
@@ -484,23 +540,23 @@ function updateAI(dt) {
         // Teammate has ball — make supporting runs
         const supportX = ball.owner.x - 80 + (p.homeX < GW / 2 ? -60 : 60);
         const supportY = p.homeY + (ball.y - GH / 2) * 0.4;
-        moveToward(p, Math.max(30, supportX), supportY, AI_SPEED * 0.9, dt);
+        moveToward(p, Math.max(30, supportX), supportY, AI_SPEED * 0.7, dt);
       } else if (ball.owner && ball.owner.team === 1) {
         // Opponent has ball — track back defensively
         const defX = Math.max(p.homeX, ball.x + 60);
         const defY = p.homeY + (ball.y - GH / 2) * 0.35;
-        moveToward(p, defX, defY, AI_SPEED * 1.1, dt);
+        moveToward(p, defX, defY, AI_SPEED * 0.8, dt);
         // Nearby players press
         const distToOwner = Math.sqrt((ball.owner.x - p.x) ** 2 + (ball.owner.y - p.y) ** 2);
-        if (distToOwner < 100) {
-          moveToward(p, ball.owner.x, ball.owner.y, AI_SPEED * 1.4, dt);
+        if (distToOwner < 80) {
+          moveToward(p, ball.owner.x, ball.owner.y, AI_SPEED * 1.1, dt);
           tryTackle(p, ball.owner);
         }
       } else {
         // Loose ball — drift toward ball biased by formation
         const targetX = p.homeX * 0.5 + ball.x * 0.5;
         const targetY = p.homeY * 0.6 + ball.y * 0.4;
-        moveToward(p, targetX, targetY, AI_SPEED * 0.9, dt);
+        moveToward(p, targetX, targetY, AI_SPEED * 0.7, dt);
       }
 
       // Opportunistic pickup/tackle
@@ -527,8 +583,8 @@ function moveToward(p, tx, ty, speed, dt) {
   const dx = tx - p.x, dy = ty - p.y;
   const d = Math.sqrt(dx * dx + dy * dy);
   if (d > 3) {
-    p.vx += (dx / d) * speed * dt * 10;
-    p.vy += (dy / d) * speed * dt * 10;
+    p.vx += (dx / d) * speed * dt * 8;
+    p.vy += (dy / d) * speed * dt * 8;
     p.facingX = dx / d;
     p.facingY = dy / d;
   }
@@ -732,7 +788,7 @@ function triggerGoal(teamNum) {
 // ── Stars ──────────────────────────────────────────────────
 const stars = [];
 for (let i = 0; i < 80; i++) {
-  stars.push({ x: Math.random() * W, y: Math.random() * 100, s: Math.random() * 2 + 0.5, b: Math.random(), speed: Math.random() * 0.3 + 0.1 });
+  stars.push({ x: Math.random() * W, y: Math.random() * 110, s: Math.random() * 2 + 0.5, b: Math.random(), speed: Math.random() * 0.3 + 0.1 });
 }
 
 // ── Drawing Helpers ────────────────────────────────────────
@@ -826,7 +882,7 @@ function drawPitch() {
   }
 
   // Penalty areas
-  const paW = 100, paH = 220;
+  const paW = 100, paH = 300;
   drawLine3D(0, GH / 2 - paH / 2, 0, paW, GH / 2 - paH / 2, 0, 'rgba(255,255,255,0.5)', 1.5);
   drawLine3D(paW, GH / 2 - paH / 2, 0, paW, GH / 2 + paH / 2, 0, 'rgba(255,255,255,0.5)', 1.5);
   drawLine3D(paW, GH / 2 + paH / 2, 0, 0, GH / 2 + paH / 2, 0, 'rgba(255,255,255,0.5)', 1.5);
